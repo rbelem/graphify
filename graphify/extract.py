@@ -8845,6 +8845,209 @@ def _check_tree_sitter_version() -> None:
         )
 
 
+def extract_perl(path: Path) -> dict:
+    """Extract packages, subs, use/require imports, and calls from a .pl/.pm file via tree-sitter."""
+    try:
+        import tree_sitter_perl as tsperl
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree_sitter_perl not installed"}
+
+    try:
+        language = Language(tsperl.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    function_bodies: list[tuple[str, Any]] = []
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}",
+                          "confidence_score": 1.0})
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "confidence_score": weight,
+                "source_file": str_path, "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    def walk(node, parent_pkg_nid: str | None = None) -> None:
+        t = node.type
+
+        if t == "package_statement":
+            pkg_name: str | None = None
+            for child in node.children:
+                if child.type == "package":
+                    text = _read_text(child, source)
+                    if text != "package":
+                        pkg_name = text
+                        break
+            if pkg_name:
+                line = node.start_point[0] + 1
+                pkg_nid = _make_id(stem, pkg_name)
+                add_node(pkg_nid, pkg_name, line)
+                add_edge(file_nid, pkg_nid, "contains", line)
+                for child in node.children:
+                    walk(child, parent_pkg_nid=pkg_nid)
+            return
+
+        if t == "subroutine_declaration_statement":
+            sub_name: str | None = None
+            body_node = None
+            for child in node.children:
+                if child.type == "bareword":
+                    sub_name = _read_text(child, source)
+                elif child.type == "block":
+                    body_node = child
+            if sub_name:
+                line = node.start_point[0] + 1
+                container = parent_pkg_nid or file_nid
+                sub_nid = _make_id(container, sub_name)
+                add_node(sub_nid, f"{sub_name}()", line)
+                add_edge(container, sub_nid, "contains", line)
+                if body_node:
+                    function_bodies.append((sub_nid, body_node))
+            return
+
+        if t == "use_statement":
+            mod_name: str | None = None
+            for child in node.children:
+                if child.type == "package":
+                    mod_name = _read_text(child, source)
+                    break
+            if mod_name:
+                line = node.start_point[0] + 1
+                mod_nid = _make_id(mod_name)
+                add_node(mod_nid, mod_name, line)
+                add_edge(file_nid, mod_nid, "imports_from", line)
+            return
+
+        if t == "require_expression":
+            req_name: str | None = None
+            for child in node.children:
+                if child.type in ("string_literal", "string_content"):
+                    req_name = _read_text(child, source).strip("'\"")
+                elif child.type == "package":
+                    req_name = _read_text(child, source)
+                if req_name:
+                    break
+            if req_name:
+                line = node.start_point[0] + 1
+                req_nid = _make_id(req_name)
+                add_node(req_nid, req_name, line)
+                add_edge(file_nid, req_nid, "imports", line)
+            return
+
+        for child in node.children:
+            walk(child, parent_pkg_nid)
+
+    walk(root)
+
+    label_to_nid: dict[str, str] = {}
+    for n in nodes:
+        raw = n["label"]
+        normalised = raw.strip("()").lstrip(".")
+        if normalised:
+            label_to_nid[normalised.lower()] = n["id"]
+
+    seen_call_pairs: set[tuple[str, str]] = set()
+    raw_calls: list[dict] = []
+    _PERL_SKIP = frozenset({
+        "if", "unless", "while", "until", "for", "foreach", "given", "when", "default",
+        "return", "last", "next", "redo", "goto", "die", "exit", "warn", "print", "say",
+        "printf", "sprintf", "open", "close", "read", "write", "seek", "tell",
+        "mkdir", "rmdir", "chdir", "chmod", "chown", "rename", "link", "unlink",
+        "stat", "lstat", "truncate", "eval", "do", "require", "use", "no",
+        "my", "our", "state", "local", "undef", "defined", "exists", "delete",
+        "keys", "values", "each", "grep", "map", "sort", "join", "split",
+        "reverse", "length", "index", "rindex", "substr", "pack", "unpack",
+        "chr", "ord", "hex", "oct", "int", "abs", "sqrt", "rand", "srand",
+        "sin", "cos", "exp", "log", "atan2", "caller", "wantarray", "ref",
+        "bless", "tie", "untie", "push", "pop", "shift", "unshift", "splice",
+        "scalar", "blessed", "import", "can", "isa", "shift", "unshift",
+    })
+
+    def walk_calls(node, caller_nid: str) -> None:
+        if node.type == "subroutine_declaration_statement":
+            return
+        t = node.type
+        if t == "function_call_expression" and node.children:
+            func_node = None
+            for child in node.children:
+                if child.type == "function":
+                    func_node = child
+                    break
+            if func_node:
+                callee_name = _read_text(func_node, source)
+                if callee_name and callee_name.lower() not in _PERL_SKIP:
+                    tgt_nid = label_to_nid.get(callee_name.lower())
+                    if tgt_nid and tgt_nid != caller_nid:
+                        pair = (caller_nid, tgt_nid)
+                        if pair not in seen_call_pairs:
+                            seen_call_pairs.add(pair)
+                            line = node.start_point[0] + 1
+                            add_edge(caller_nid, tgt_nid, "calls", line,
+                                     confidence="EXTRACTED", weight=1.0, context="call")
+                    elif callee_name:
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": callee_name,
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+        elif t == "method_call_expression" and node.children:
+            method_node = None
+            for child in node.children:
+                if child.type == "method":
+                    method_node = child
+                    break
+            if method_node:
+                method_name = _read_text(method_node, source)
+                if method_name:
+                    tgt_nid = label_to_nid.get(method_name.lower())
+                    if tgt_nid and tgt_nid != caller_nid:
+                        pair = (caller_nid, tgt_nid)
+                        if pair not in seen_call_pairs:
+                            seen_call_pairs.add(pair)
+                            line = node.start_point[0] + 1
+                            add_edge(caller_nid, tgt_nid, "calls", line,
+                                     confidence="EXTRACTED", weight=1.0, context="call")
+                    else:
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": method_name,
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+        for child in node.children:
+            walk_calls(child, caller_nid)
+
+    for caller_nid, body_node in function_bodies:
+        walk_calls(body_node, caller_nid)
+
+    clean_edges = [e for e in edges if e["source"] in seen_ids and
+                   (e["target"] in seen_ids or e["relation"] in ("imports", "imports_from"))]
+    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+
+
 def extract_bash(path: Path) -> dict:
     """Extract functions, source imports, and cross-function calls from a .sh file."""
     try:
@@ -10102,6 +10305,8 @@ _DISPATCH: dict[str, Any] = {
     ".vbproj": extract_csproj,
     ".razor": extract_razor,
     ".cshtml": extract_razor,
+    ".pl": extract_perl,
+    ".pm": extract_perl,
 }
 
 

@@ -41,6 +41,7 @@ dependencies = [
     "tree-sitter-bash",
     "tree-sitter-json",
     "tree-sitter-dm",
+    "tree-sitter-perl",
 ]
 
 [project.urls]
@@ -65,7 +66,8 @@ gemini = ["openai", "tiktoken"]
 openai = ["openai", "tiktoken"]
 chinese = ["jieba"]
 sql = ["tree-sitter-sql"]
-all = ["mcp", "neo4j", "pypdf", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper; python_version >= '3.11'", "yt-dlp", "matplotlib", "openai", "tiktoken", "boto3", "tree-sitter-sql", "jieba"]
+perl = ["tree-sitter-perl"]
+all = ["mcp", "neo4j", "pypdf", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper; python_version >= '3.11'", "yt-dlp", "matplotlib", "openai", "tiktoken", "boto3", "tree-sitter-sql", "jieba", "tree-sitter-perl"]
 
 [project.scripts]
 graphify = "graphify.__main__:main"

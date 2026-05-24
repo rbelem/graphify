@@ -1,5 +1,5 @@
 from pathlib import Path
-from graphify.extract import extract_python, extract, collect_files, _make_id, extract_bash, extract_json, _DISPATCH
+from graphify.extract import extract_python, extract, collect_files, _make_id, extract_bash, extract_json, extract_perl, _DISPATCH
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -588,6 +588,8 @@ def test_dispatch_includes_sh_and_json():
     assert ".sh" in _DISPATCH
     assert ".bash" in _DISPATCH
     assert ".json" in _DISPATCH
+    assert ".pl" in _DISPATCH
+    assert ".pm" in _DISPATCH
 
 
 def test_extract_bash_finds_functions():
@@ -841,6 +843,74 @@ def test_extract_bash_source_user_defined_emits_calls_not_imports_from(tmp_path)
     assert not import_edges, (
         f"'source' is a user-defined function; 'source ./helpers.sh' must not emit imports_from; got: {import_edges}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Perl extractor tests
+# ---------------------------------------------------------------------------
+
+
+def test_extract_perl_missing_grammar_returns_error():
+    """extract_perl returns error dict when tree-sitter-perl not installed (mocked)."""
+    import unittest.mock as mock
+    import builtins
+    real_import = builtins.__import__
+
+    def patched(name, *args, **kwargs):
+        if name == "tree_sitter_perl":
+            raise ImportError("mocked")
+        return real_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=patched):
+        result = extract_perl(FIXTURES / "sample.pl")
+    assert "error" in result
+    assert result["nodes"] == []
+
+def test_extract_perl_finds_packages():
+    result = extract_perl(FIXTURES / "sample.pl")
+    assert "error" not in result
+    labels = {n["label"] for n in result["nodes"]}
+    assert "MyApp::Greeter" in labels
+    assert "MyApp::Runner" in labels
+
+
+def test_extract_perl_finds_subs():
+    result = extract_perl(FIXTURES / "sample.pl")
+    labels = {n["label"] for n in result["nodes"]}
+    assert "new()" in labels
+    assert "greet()" in labels
+    assert "_format()" in labels
+    assert "run()" in labels
+
+
+def test_extract_perl_emits_contains_edges():
+    result = extract_perl(FIXTURES / "sample.pl")
+    relations = {e["relation"] for e in result["edges"]}
+    assert "contains" in relations
+
+
+def test_extract_perl_emits_imports_edges():
+    result = extract_perl(FIXTURES / "sample.pl")
+    imports = [(e["source"], e["target"], e["relation"]) for e in result["edges"]
+               if e["relation"] in ("imports", "imports_from")]
+    assert len(imports) > 0
+
+
+def test_extract_perl_no_dangling_edges():
+    """All edge sources must reference a known node (targets may be external imports)."""
+    result = extract_perl(FIXTURES / "sample.pl")
+    node_ids = {n["id"] for n in result["nodes"]}
+    for edge in result["edges"]:
+        assert edge["source"] in node_ids, f"Dangling source: {edge['source']}"
+
+
+def test_extract_perl_structural_edges_are_extracted():
+    """contains / imports / imports_from edges must always be EXTRACTED."""
+    result = extract_perl(FIXTURES / "sample.pl")
+    structural = {"contains", "imports", "imports_from"}
+    for edge in result["edges"]:
+        if edge["relation"] in structural:
+            assert edge["confidence"] == "EXTRACTED", f"Expected EXTRACTED: {edge}"
 
 
 # ---------------------------------------------------------------------------
