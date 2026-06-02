@@ -2,6 +2,33 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.8.28 (2026-06-01)
+
+- Feat: Kilo Code support — `graphify install --platform kilo` installs a native skill (`~/.config/kilo/skills/graphify/SKILL.md`) and `/graphify` command, plus a `.kilo` `tool.execute.before` plugin (mirroring the OpenCode integration). Existing `.kilo/kilo.jsonc` config is read but never rewritten — plugin registration goes to `kilo.json` so user comments are preserved (#512)
+- Feat: modernized Dart extractor — comment stripping, `part of` redirection, nested-generic-aware `extends`/`with`/`implements` parsing, generic type-argument mapping, and generic call detection (#1098)
+- Fix: `uv tool install graphifyy` / `pip install graphifyy` no longer fails to build on Linux/macOS — `tree-sitter-dm` (BYOND DreamMaker) ships only a Windows wheel, so on other platforms it compiled from source and aborted the entire install when a C toolchain or `python3-dev` headers were missing. It is now an optional extra (`graphifyy[dm]`, also in `[all]`) instead of a core dependency, so the default install needs no compiler (#1104).
+  - **Upgrade note:** DreamMaker `.dm`/`.dme` users must reinstall with `graphifyy[dm]` (or `[all]`) to keep AST extraction — on `uv tool upgrade` the now-optional grammar is removed. `.dmi`/`.dmm`/`.dmf` parsing is unaffected (no tree-sitter dependency).
+- Fix: community IDs are now assigned by a total order (`(-size, sorted node IDs)`) so an identical grouping always gets identical IDs across runs — previously the equal-sized small communities that dominate a sparse graph were numbered by the partitioner's (not seed-stable) enumeration order, making a per-node community diff report large spurious "churn" even though the actual grouping was reproducible (#1090 follow-up)
+
+## 0.8.27 (2026-05-31)
+
+- Feat: standalone CLI now auto-names communities with the configured backend instead of leaving `Community N` placeholders — community labeling was previously an agent-only step (skill.md Step 5), so bare-CLI runs never got semantic names; `cluster-only` now auto-labels when no `.graphify_labels.json` exists, new `graphify label <path>` subcommand (re)generates names on demand, `--no-label` opts out, `--backend=<name>` overrides auto-detection; one batched LLM call with per-community placeholder fallback and graceful degradation on missing backend/API error; works with all built-in and custom OpenAI-compatible backends (#1097)
+- Fix: AST file-level node IDs now match the skill.md `{parent_dir}_{stem}` spec — they were derived from the full relative path plus extension (`match_script_pipeline_step_py`) while semantic subagents use `script_pipeline_step`, splitting every file into two disconnected ghost nodes; fixed at the single relative-path remap chokepoint so file nodes and all import/dependency edge endpoints (Python, TS, Lua, C, bash) convert together (#1033)
+- Fix: symbol-level node IDs for root-level files now match the spec too — the #1033 remap relativized file nodes but symbols still embedded the absolute parent-dir name (`<rootdir>_main_run` vs spec `main_run`), splitting every top-level file's symbols into AST/semantic ghost pairs; the remap now canonicalizes symbol stems and `raw_calls` caller IDs, gated by `source_file` (#1096)
+- Fix: TypeScript `interface A extends B` and same-file `class X extends Y` now produce `inherits`/`implements` edges — the walker only inspected `class_heritage` (missing the interface `extends_type_clause` node) and the resolver only consulted the import table (missing same-file bases); both gaps closed (#1095)
+- Fix: `graphify export obsidian` no longer crashes with `OSError ENAMETOOLONG` on long node labels — `to_obsidian`/`to_canvas` now cap filenames on UTF-8 bytes (not chars, so multibyte/CJK labels are handled) with an 8-char hash suffix on truncation to keep distinct long-prefix labels from colliding; also fixes the previously-uncapped `_COMMUNITY_` notes (#1094)
+- Fix: `graph.json` is now deterministic across runs — `detect()` sorts file traversal lexicographically (`os.walk` order is filesystem-dependent), which had made first-writer-wins node-ID decisions and Leiden community counts vary between identical runs (#1090)
+- Fix: Windows consoles no longer crash with `UnicodeEncodeError` on non-UTF-8 code pages — `main()` reconfigures stdout/stderr to UTF-8 at startup and `→`/`—` in print statements replaced with ASCII (#992)
+
+## 0.8.26 (2026-05-30)
+
+- Feat: `find_import_cycles(G)` in `analyze.py` detects file-level circular import dependencies — collapses symbol graph to file-level directed import graph, finds simple cycles via Johnson's algorithm, deduplicates rotations, renders `## Import Cycles` section in `GRAPH_REPORT.md` (#961)
+- Feat: custom LLM provider registry — `graphify provider add/list/show/remove` registers any OpenAI-compatible endpoint (NVIDIA NIM, vLLM, OpenRouter, Together, LiteLLM) via `~/.graphify/providers.json`; custom providers auto-detected after built-ins in `detect_backend()` priority (#1084)
+- Fix: `extract_files_direct()` no longer silently defaults to kimi (Moonshot AI) — `backend=None` now calls `detect_backend()` and raises a clear `ValueError` if no key is configured, matching CLI behavior; README Privacy section updated with data-residency notes (#1086)
+- Fix: `pnpm-workspace.yaml` with `packages: - '.'` no longer crashes with `IndexError: tuple index out of range` on Python 3.10 — `Path.glob('.')` replaced with `[root]` guard in `_load_workspace_packages`; `GRAPHIFY_DEBUG=1` env var added to `_safe_extract` for full traceback on extraction errors (#1083)
+- Fix: anchored `.graphifyignore` patterns (leading `/`) no longer match the same directory name anywhere in the tree — `_matches()` in both `_is_ignored` and `_is_included` now gates basename/segment shortcuts on `not anchored`; anchored patterns do exact anchor-relative path match only (#1087)
+- Docs: Filipino (fil-PH) README translation added (#1080)
+
 ## 0.8.25 (2026-05-29)
 
 - Fix: JS/TS `const`/`let` inside arrow-function callbacks no longer emit phantom god-nodes — scope guard restricts `_js_extra_walk` node emission to program-level declarations only; applies uniformly to JS, TS, and TSX (#1077)
