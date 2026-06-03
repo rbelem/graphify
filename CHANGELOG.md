@@ -2,6 +2,21 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.8.30 (2026-06-03)
+
+- Fix: `graphify install --project --platform antigravity` now writes Antigravity's always-on layer (`.agents/rules/graphify.md` + `.agents/workflows/graphify.md`), not just the skill. The project-scoped path went through the skill-only branch and skipped them, even though the project uninstall removes them.
+- Feat: close the Read-tool graph bypass. The `PreToolUse` nudge previously only fired on Bash search (`grep`/`rg`/`find`); an agent answering a question by reading many source files through the native `Read` tool (or `Glob`) slipped past it. A new `Read|Glob` hook nudges toward `graphify query` when `graphify-out/graph.json` exists, only for a source/doc file outside `graphify-out/`, and never blocks (#1114).
+- Feat: add an `anthropic` optional extra (and include it in `[all]`) so the `claude` backend is installable like every other one: `uv tool install "graphifyy[anthropic]"`. Previously it was the only backend with no extra, so a user with `ANTHROPIC_API_KEY` set could not satisfy it without `--with anthropic`. The backend package-missing errors now point at `uv tool install "graphifyy[<extra>]"` (the isolated-venv path) rather than only `pip install`.
+
+## 0.8.29 (2026-06-02)
+
+- Feat: progressive-disclosure skill files. The per-host `SKILL.md` is now a lean core (~615 lines, down from the ~1156-line monolith, about 47% less always-loaded context) that carries the full default code-build pipeline inline and links to an on-demand `references/` sidecar (extraction-spec, query, update, exports, transcribe, github-and-merge, add-watch, hooks); an agent reads a reference only when that path is actually taken, so a normal build needs none. 18 hosts go progressive (claude, codex, opencode, kilo, copilot, claw, droid, trae, trae-cn, hermes, kiro, pi, antigravity, antigravity-windows, windows, kimi, amp, gemini); aider and devin stay monolithic by design. All 15 skill bodies + sidecars are generated from one source under `tools/skillgen/`, with CI guards (`--check`, `--audit-coverage`, `--monolith-roundtrip`, `--always-on-roundtrip`) proving the references are byte-identical slices of the old monolith so nothing is lost (#1121).
+- Fix: `graphify install --platform gemini` shipped a `SKILL.md` with 8 dead `references/` pointers. gemini installs claude's lean progressive core but the installer never copied claude's references sidecar; it now does, so every on-demand reference resolves (regression from the progressive-disclosure split).
+- Security (F1): a project-local `./.graphify/providers.json` (which travels with a cloned or shared repo) is no longer loaded automatically, since a custom provider's `base_url` is where your corpus and API key are sent. Set `GRAPHIFY_ALLOW_LOCAL_PROVIDERS=1` to opt in; the user's own `~/.graphify/providers.json` is still trusted. Non-http(s) `base_url`s are rejected on load and on `provider add`, and plaintext-http egress warns. **Behavior change:** if you relied on an auto-loaded project-local providers file, set the opt-in env var.
+- Security (F2): untrusted office/PDF files are screened before parsing (on-disk size cap, plus a bounded streaming-decompression ceiling for `.docx`/`.xlsx` zip containers) so a zip-bomb in a scanned corpus can no longer exhaust memory.
+- Security (F3): `OLLAMA_BASE_URL` pointing at a link-local or cloud-metadata address (`169.254.x`, `metadata.google.*`, or any host that resolves to one) now fails closed with a clean error instead of sending the corpus there. Trusted LAN hosts still warn-and-allow.
+- Security (F5): the Fortran C-preprocessor step passes an absolute path so an attacker-named corpus file cannot be interpreted as a `cpp` option.
+
 ## 0.8.28 (2026-06-01)
 
 - Feat: Kilo Code support — `graphify install --platform kilo` installs a native skill (`~/.config/kilo/skills/graphify/SKILL.md`) and `/graphify` command, plus a `.kilo` `tool.execute.before` plugin (mirroring the OpenCode integration). Existing `.kilo/kilo.jsonc` config is read but never rewritten — plugin registration goes to `kilo.json` so user comments are preserved (#512)
@@ -9,6 +24,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 - Fix: `uv tool install graphifyy` / `pip install graphifyy` no longer fails to build on Linux/macOS — `tree-sitter-dm` (BYOND DreamMaker) ships only a Windows wheel, so on other platforms it compiled from source and aborted the entire install when a C toolchain or `python3-dev` headers were missing. It is now an optional extra (`graphifyy[dm]`, also in `[all]`) instead of a core dependency, so the default install needs no compiler (#1104).
   - **Upgrade note:** DreamMaker `.dm`/`.dme` users must reinstall with `graphifyy[dm]` (or `[all]`) to keep AST extraction — on `uv tool upgrade` the now-optional grammar is removed. `.dmi`/`.dmm`/`.dmf` parsing is unaffected (no tree-sitter dependency).
 - Fix: community IDs are now assigned by a total order (`(-size, sorted node IDs)`) so an identical grouping always gets identical IDs across runs — previously the equal-sized small communities that dominate a sparse graph were numbered by the partitioner's (not seed-stable) enumeration order, making a per-node community diff report large spurious "churn" even though the actual grouping was reproducible (#1090 follow-up)
+- Fix: `graphify amp install` now writes the skill where Amp actually looks for it. It was landing in `.amp/skills/graphify` (project) and `~/.amp/skills/graphify` (user), neither of which Amp searches, so the skill never loaded. User-scope installs now go to `~/.config/agents/skills/graphify` and project installs to `.agents/skills/graphify`, and a stale `~/.amp/skills/graphify` from an older install is cleaned up on the next run.
 
 ## 0.8.27 (2026-05-31)
 
