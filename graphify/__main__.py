@@ -359,7 +359,7 @@ _SETTINGS_HOOK = {
                 "case \"$CMD\" in "
                 r"*grep*|*rg\ *|*ripgrep*|*find\ *|*fd\ *|*ack\ *|*ag\ *) "
                 "  [ -f graphify-out/graph.json ] && "
-                r"""  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify: knowledge graph at graphify-out/. For focused questions, run `graphify query \"<question>\"` (scoped subgraph, usually much smaller than GRAPH_REPORT.md) instead of grepping raw files. Read GRAPH_REPORT.md only for broad architecture context."}}' """
+                r"""  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"MANDATORY: graphify-out/graph.json exists. You MUST run `graphify query \"<question>\"` before grepping raw files. Only grep after graphify has oriented you, or to modify/debug specific lines."}}' """
                 "  || true ;; "
                 "esac"
             ),
@@ -389,7 +389,7 @@ _READ_SETTINGS_HOOK = {
                 "exts=('.py','.js','.ts','.tsx','.jsx','.go','.rs','.java','.rb','.c','.h','.cpp','.hpp','.cc','.cs','.kt','.swift','.php','.scala','.lua','.sh','.md','.rst','.txt','.mdx');"
                 "sys.stdout.write('1' if 'graphify-out/' not in s and any(e in s for e in exts) else '')\" 2>/dev/null || true); "
                 "if [ \"$HIT\" = 1 ] && [ -f graphify-out/graph.json ]; then "
-                r"""echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify: knowledge graph at graphify-out/. For codebase questions, run `graphify query \"<question>\"` (scoped subgraph, usually much smaller than reading files one by one), `graphify explain \"<concept>\"`, or `graphify path \"<A>\" \"<B>\"`, instead of reading source files to answer. Read raw files to modify or debug specific code, or when the graph lacks the detail."}}'; """
+                r"""echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"MANDATORY: graphify-out/graph.json exists. You MUST run graphify before reading source files. Use: `graphify query \"<question>\"` (scoped subgraph), `graphify explain \"<concept>\"`, or `graphify path \"<A>\" \"<B>\"`. Only read raw files after graphify has oriented you, or to modify/debug specific lines. This rule applies to subagents too — include it in every subagent prompt involving code exploration."}}'; """
                 "fi || true"
             ),
         }
@@ -1113,10 +1113,20 @@ alwaysApply: true
 
 This project has a graphify knowledge graph at graphify-out/.
 
-- For codebase or architecture questions, when `graphify-out/graph.json` exists, first run `graphify query "<question>"` (or `graphify path "<A>" "<B>"` / `graphify explain "<concept>"`). These return a scoped subgraph, usually much smaller than `GRAPH_REPORT.md` or raw grep output.
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context
-- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+**MANDATORY: Before using Read, Grep, Glob, or Bash to explore the codebase, you MUST run graphify first:**
+- `graphify query "<question>"` — scoped subgraph for any codebase or architecture question
+- `graphify path "<A>" "<B>"` — dependency path between two symbols
+- `graphify explain "<concept>"` — all nodes related to a concept
+
+This applies to YOU and to every subagent you spawn. Include this rule explicitly in every subagent prompt that involves code exploration. Do not skip graphify because files are "already known" or because you are executing a plan — the graph surfaces cross-file dependencies and INFERRED edges that grep and Read cannot find.
+
+Only use Read/Grep/Glob directly when:
+1. graphify has already oriented you and you need to modify or debug specific lines
+2. `graphify-out/graph.json` does not exist yet
+
+- If `graphify-out/wiki/index.md` exists, navigate it instead of reading raw files
+- Read `graphify-out/GRAPH_REPORT.md` only for broad architecture review when query/path/explain do not surface enough context
+- After modifying code files, run `graphify update .` to keep the graph current (AST-only, no API cost)
 """
 
 
@@ -2172,6 +2182,7 @@ def main() -> None:
         print("    --postgres DSN          extract schema from a live PostgreSQL database")
         print("                            maps tables, views, functions + FK relationships;")
         print("                            column-level detail is not represented in the graph")
+        print("    --cargo                 extract crate→crate deps from Cargo.toml")
         print("    --global                also merge the resulting graph into the global graph")
         print("    --as <tag>              repo tag for --global (default: target directory name)")
         print("  global add <graph.json>  add/update a project graph in the global graph (~/.graphify/global-graph.json)")
@@ -3169,7 +3180,25 @@ def main() -> None:
         from graphify.export import to_json, to_html
 
         print("Loading existing graph...")
-        _enforce_graph_size_cap_or_exit(graph_json)
+        # Solution 3 (#1019): don't hard-exit on an oversized graph.json here.
+        # Core outputs (graph.json + GRAPH_REPORT.md) still get written; the
+        # graph.html render below falls back to the community-aggregation view
+        # (node_limit=5000) when over the cap.
+        from graphify.security import check_graph_file_size_cap as _check_cap
+        _over_cap = False
+        try:
+            _check_cap(graph_json)
+        except ValueError:
+            _over_cap = True
+            try:
+                _over_cap_bytes = graph_json.stat().st_size
+            except OSError:
+                _over_cap_bytes = -1
+            print(
+                f"warning: graph.json exceeds cap ({_over_cap_bytes} bytes); "
+                f"falling back to community-aggregation view (node_limit=5000)",
+                file=sys.stderr,
+            )
         _raw = json.loads(graph_json.read_text(encoding="utf-8"))
         _directed = bool(_raw.get("directed", False))
         G = build_from_json(_raw, directed=_directed)
@@ -3238,7 +3267,11 @@ def main() -> None:
             print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated (--no-viz; graph.html removed).")
         else:
             try:
-                to_html(G, communities, str(html_target), community_labels=labels or None)
+                # Over-cap fallback (#1019): force the community-aggregation
+                # path so an oversized graph still renders a usable graph.html.
+                _node_limit = 5000 if _over_cap else None
+                to_html(G, communities, str(html_target), community_labels=labels or None,
+                        node_limit=_node_limit)
                 print(f"Done - {len(communities)} communities. GRAPH_REPORT.md, graph.json and graph.html updated.")
             except ValueError as viz_err:
                 if html_target.exists():
@@ -3644,8 +3677,30 @@ def main() -> None:
 
         from networkx.readwrite import json_graph as _jg
         from graphify.build import build_from_json as _bfj
+        from graphify.security import check_graph_file_size_cap as _check_cap
 
-        _enforce_graph_size_cap_or_exit(graph_path)
+        # Solution 3 (#1019): for the HTML view, an oversized graph.json should
+        # not be a hard error. Detect the over-cap condition here and fall back
+        # to the community-aggregation view (node_limit=5000) below instead of
+        # exiting 1. All other subcommands keep the hard cap.
+        _over_cap = False
+        try:
+            _check_cap(graph_path)
+        except ValueError as _cap_err:
+            if subcmd == "html":
+                _over_cap = True
+                try:
+                    _over_cap_bytes = graph_path.stat().st_size
+                except OSError:
+                    _over_cap_bytes = -1
+                print(
+                    f"warning: graph.json exceeds cap ({_over_cap_bytes} bytes); "
+                    f"falling back to community-aggregation view (node_limit=5000)",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"error: {_cap_err}", file=sys.stderr)
+                sys.exit(1)
         _raw = json.loads(graph_path.read_text(encoding="utf-8"))
         if "links" not in _raw and "edges" in _raw:
             _raw = dict(_raw, links=_raw["edges"])
@@ -3702,10 +3757,15 @@ def main() -> None:
                     html_target.unlink()
                 print("--no-viz: skipped graph.html")
             else:
+                # Over-cap fallback (#1019): force the community-aggregation
+                # path so the oversized graph still renders a usable artifact.
+                _effective_node_limit = 5000 if _over_cap else node_limit
                 _to_html(G, communities, str(out_dir / "graph.html"),
-                         community_labels=labels or None, node_limit=node_limit)
-                if G.number_of_nodes() <= node_limit:
+                         community_labels=labels or None, node_limit=_effective_node_limit)
+                if G.number_of_nodes() <= _effective_node_limit:
                     print(f"graph.html written - open in any browser, no server needed")
+                if _over_cap:
+                    sys.exit(0)
 
         elif subcmd == "obsidian":
             from graphify.export import to_obsidian as _to_obsidian, to_canvas as _to_canvas
@@ -3845,7 +3905,7 @@ def main() -> None:
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
-                "[--api-timeout S] [--postgres DSN]",
+                "[--api-timeout S] [--postgres DSN] [--cargo]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -3865,6 +3925,7 @@ def main() -> None:
         extract_mode: str | None = None
         out_dir: Path | None = None
         cli_postgres_dsn: str | None = None
+        cli_cargo: bool = False
         no_cluster = False
         dedup_llm = False
         google_workspace = False
@@ -3964,6 +4025,9 @@ def main() -> None:
                 cli_postgres_dsn = args[i + 1]; i += 2
             elif a.startswith("--postgres="):
                 cli_postgres_dsn = a.split("=", 1)[1]; i += 1
+            elif a == "--cargo":
+                cli_cargo = True
+                i += 1
             else:
                 i += 1
 
@@ -4147,7 +4211,10 @@ def main() -> None:
         ast_result: dict = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
         if code_files:
             from graphify.extract import extract as _ast_extract
-            ast_kwargs: dict = {"cache_root": target}
+            # Anchor the cache at the output root, not the scanned project:
+            # with --out, a <target>/graphify-out/cache/ would leak a
+            # graphify-out/ dir into a project that asked for external output.
+            ast_kwargs: dict = {"cache_root": out_root}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
             print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
@@ -4171,7 +4238,7 @@ def main() -> None:
         if semantic_files:
             sem_paths_str = [str(p) for p in semantic_files]
             cached_nodes, cached_edges, cached_hyperedges, uncached_paths = (
-                _check_semantic_cache(sem_paths_str, root=target)
+                _check_semantic_cache(sem_paths_str, root=out_root)
             )
             sem_cache_hits = len(semantic_files) - len(uncached_paths)
             sem_cache_misses = len(uncached_paths)
@@ -4241,7 +4308,7 @@ def main() -> None:
                         fresh.get("nodes", []),
                         fresh.get("edges", []),
                         fresh.get("hyperedges", []),
-                        root=target,
+                        root=out_root,
                     )
                 except Exception as exc:
                     print(f"[graphify extract] warning: could not write semantic cache: {exc}", file=sys.stderr)
@@ -4263,13 +4330,25 @@ def main() -> None:
             print(f"[graphify extract] PostgreSQL: {len(pg_result['nodes'])} nodes, "
                   f"{len(pg_result['edges'])} edges")
 
-        # Merge AST + semantic + pg_result. Order matters for deduplication: passing AST
+        cargo_result: dict = {"nodes": [], "edges": []}
+        if cli_cargo:
+            from graphify.cargo_introspect import introspect_cargo
+            print("[graphify extract] introspecting Cargo workspace...")
+            try:
+                cargo_result = introspect_cargo(target)
+            except (ConnectionError, ImportError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(f"[graphify extract] Cargo: {len(cargo_result['nodes'])} nodes, "
+                  f"{len(cargo_result['edges'])} edges")
+
+        # Merge AST + semantic + pg_result + cargo_result. Order matters for deduplication: passing AST
         # first means semantic node attributes win on collision (richer labels
         # for symbols also referenced in docs). Hyperedges only come from the
         # semantic side.
         merged: dict = {
-            "nodes": list(ast_result.get("nodes", [])) + list(sem_result.get("nodes", [])) + list(pg_result.get("nodes", [])),
-            "edges": list(ast_result.get("edges", [])) + list(sem_result.get("edges", [])) + list(pg_result.get("edges", [])),
+            "nodes": list(ast_result.get("nodes", [])) + list(sem_result.get("nodes", [])) + list(pg_result.get("nodes", [])) + list(cargo_result.get("nodes", [])),
+            "edges": list(ast_result.get("edges", [])) + list(sem_result.get("edges", [])) + list(pg_result.get("edges", [])) + list(cargo_result.get("edges", [])),
             "hyperedges": list(sem_result.get("hyperedges", [])),
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
