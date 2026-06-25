@@ -481,7 +481,7 @@ def _git_head() -> str | None:
         return None
 
 
-def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None) -> bool:
+def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None) -> bool:
     # Safety check: refuse to silently shrink an existing graph (#479)
     existing_path = Path(output_path)
     if not force and existing_path.exists():
@@ -508,12 +508,16 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
             pass  # unreadable existing file — proceed with write
 
     node_community = _node_community_map(communities)
+    _labels: dict[int, str] = {int(k): v for k, v in (community_labels or {}).items()}
     try:
         data = json_graph.node_link_data(G, edges="links")
     except TypeError:
         data = json_graph.node_link_data(G)
     for node in data["nodes"]:
-        node["community"] = node_community.get(node["id"])
+        cid = node_community.get(node["id"])
+        node["community"] = cid
+        if cid is not None and _labels:
+            node["community_name"] = _labels.get(cid, f"Community {cid}")
         node["norm_label"] = _strip_diacritics(node.get("label", "")).lower()
     for link in data["links"]:
         if "confidence_score" not in link:
@@ -862,7 +866,14 @@ def to_obsidian(
         cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
         # Strip trailing .md/.mdx/.markdown so "CLAUDE.md" doesn't become "CLAUDE.md.md"
         cleaned = re.sub(r"\.(md|mdx|qmd|markdown)$", "", cleaned, flags=re.IGNORECASE)
-        return _cap_filename(cleaned) if cleaned else "unnamed"
+        # A stem of only punctuation (e.g. "@", "*", "#") survives the unsafe-char
+        # strip above but is empty once a downstream tool re-slugs on word chars
+        # (e.g. qmd's handelize() reduces "@" -> "" and raises, aborting the whole
+        # `qmd update`). Require at least one word char; else fall back so we never
+        # emit a "@.md"-style filename. (#1409)
+        if not re.search(r"\w", cleaned, flags=re.UNICODE):
+            return "unnamed"
+        return _cap_filename(cleaned)
 
     node_filename: dict[str, str] = {}
     seen_names: dict[str, int] = {}
@@ -1108,7 +1119,14 @@ def to_canvas(
     def safe_name(label: str) -> str:
         cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
         cleaned = re.sub(r"\.(md|mdx|qmd|markdown)$", "", cleaned, flags=re.IGNORECASE)
-        return _cap_filename(cleaned) if cleaned else "unnamed"
+        # A stem of only punctuation (e.g. "@", "*", "#") survives the unsafe-char
+        # strip above but is empty once a downstream tool re-slugs on word chars
+        # (e.g. qmd's handelize() reduces "@" -> "" and raises, aborting the whole
+        # `qmd update`). Require at least one word char; else fall back so we never
+        # emit a "@.md"-style filename. (#1409)
+        if not re.search(r"\w", cleaned, flags=re.UNICODE):
+            return "unnamed"
+        return _cap_filename(cleaned)
 
     # Build node_filenames if not provided (same dedup logic as to_obsidian)
     if node_filenames is None:
@@ -1122,6 +1140,13 @@ def to_canvas(
             else:
                 seen_names[base] = 0
                 node_filenames[node_id] = base
+
+    # Fallback: with no community data (e.g. --no-cluster builds or a missing
+    # analysis sidecar) the grid below produces nothing and the canvas is written
+    # as an empty 32-byte shell on an otherwise populated graph. Emit every node
+    # into one synthetic community so the canvas always reflects the graph (#1324).
+    if not communities and G.number_of_nodes() > 0:
+        communities = {0: [str(n) for n in G.nodes()]}
 
     num_communities = len(communities)
     cols = math.ceil(math.sqrt(num_communities)) if num_communities > 0 else 1

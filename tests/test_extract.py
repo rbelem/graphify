@@ -100,6 +100,29 @@ def test_extract_disambiguates_duplicate_symbol_ids_by_source_path(tmp_path):
             assert edge["target"] in node_ids, f"Dangling structural target: {edge}"
 
 
+def test_cross_file_type_annotation_refs_resolve_to_single_node(tmp_path):
+    """#1402: a class defined once but referenced via type annotations in N other
+    files must NOT create 1+N phantom duplicate nodes (with the referencing file's
+    path — extension and all — baked into the id, e.g. ``pkg_a_py_thing``). The
+    annotation references resolve to the single canonical definition.
+
+    Contrast with test_extract_disambiguates_...: genuinely *defined* duplicates
+    stay separate; only cross-file *references* collapse onto the real node."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "thing.py").write_text("class Thing:\n    def run(self):\n        return 1\n", encoding="utf-8")
+    (pkg / "a.py").write_text("from pkg.thing import Thing\ndef use_a(obj: Thing) -> Thing:\n    return obj\n", encoding="utf-8")
+    (pkg / "b.py").write_text("from pkg.thing import Thing\ndef use_b(obj: Thing) -> Thing:\n    return obj\n", encoding="utf-8")
+
+    result = extract([pkg / "thing.py", pkg / "a.py", pkg / "b.py"], cache_root=tmp_path)
+
+    thing_nodes = [n for n in result["nodes"] if n["label"] == "Thing"]
+    assert len(thing_nodes) == 1, [n["id"] for n in thing_nodes]
+    # The tell-tale phantom signature is the referencing file's path (with .py
+    # extension) baked into the id — must not appear.
+    assert "_py" not in thing_nodes[0]["id"], thing_nodes[0]["id"]
+
+
 def test_extract_updates_raw_call_callers_after_duplicate_id_disambiguation(tmp_path):
     first = tmp_path / "apps/api/Program.cs"
     second = tmp_path / "tools/api/Program.cs"
@@ -513,6 +536,112 @@ def test_extract_js_arrow_function_still_extracted():
         arrow_fixture.unlink()
 
 
+def test_extract_js_this_assigned_methods(tmp_path):
+    """`this.X = () => {}` / `this.X = function(){}` in a constructor-style
+    function body must be captured as methods owned by that function.
+
+    This is the dominant pattern in pre-class JS (DAOs, route handlers): the
+    methods live in the function body, which is otherwise only walked for
+    calls, so before this they were entirely invisible as symbols.
+    """
+    from graphify.extract import extract_js
+    f = tmp_path / "dao.js"
+    f.write_text(
+        "function UserDAO(db) {\n"
+        "  this.addUser = (name) => { return name; };\n"
+        "  this.getUser = function(id) { return id; };\n"
+        "}\n"
+    )
+    result = extract_js(f)
+    by_label = {n["label"]: n for n in result["nodes"]}
+    assert "UserDAO()" in by_label
+    assert ".addUser()" in by_label
+    assert ".getUser()" in by_label
+    # The methods are owned by UserDAO via a `method` edge.
+    owner = by_label["UserDAO()"]["id"]
+    method_edges = {
+        (e["source"], by_label_by_id(result, e["target"]))
+        for e in result["edges"]
+        if e["relation"] == "method"
+    }
+    assert (owner, ".addUser()") in method_edges
+    assert (owner, ".getUser()") in method_edges
+
+
+def test_extract_js_commonjs_exports_assignment(tmp_path):
+    """`exports.X = fn` and `module.exports.X = fn` must produce function nodes."""
+    from graphify.extract import extract_js
+    f = tmp_path / "mod.js"
+    f.write_text(
+        "exports.alpha = (x) => x;\n"
+        "module.exports.beta = function(y) { return y; };\n"
+    )
+    labels = [n["label"] for n in extract_js(f)["nodes"]]
+    assert "alpha()" in labels
+    assert "beta()" in labels
+
+
+def test_extract_js_prototype_method_assignment(tmp_path):
+    """`Foo.prototype.bar = fn` must be captured as a method owned by Foo."""
+    from graphify.extract import extract_js
+    f = tmp_path / "proto.js"
+    f.write_text(
+        "function Foo() {}\n"
+        "Foo.prototype.bar = function() { return 1; };\n"
+    )
+    by_label = {n["label"]: n for n in extract_js(f)["nodes"]}
+    assert "Foo()" in by_label
+    assert ".bar()" in by_label
+
+
+def test_extract_js_const_function_expression(tmp_path):
+    """`const f = function(){}` (function expression, not arrow) must be captured."""
+    from graphify.extract import extract_js
+    f = tmp_path / "fnexpr.js"
+    f.write_text("const handler = function(req, res) { return res; };\n")
+    labels = [n["label"] for n in extract_js(f)["nodes"]]
+    assert "handler()" in labels
+
+
+def test_extract_ts_class_arrow_field(tmp_path):
+    """A class field initialised with an arrow function (`x = () => {}`) must be
+    captured as a method of the class — common in React/TS component classes."""
+    from graphify.extract import extract_js
+    f = tmp_path / "comp.ts"
+    f.write_text(
+        "class Widget {\n"
+        "  onClick = (e) => { return e; };\n"
+        "  render() { return null; }\n"
+        "}\n"
+    )
+    by_label = {n["label"]: n for n in extract_js(f)["nodes"]}
+    assert "Widget" in by_label
+    assert ".onClick()" in by_label   # arrow field
+    assert ".render()" in by_label    # plain method (regression guard)
+
+
+def test_extract_js_arbitrary_member_assignment_not_captured(tmp_path):
+    """Guard against the phantom-god-node class (#1077): an arbitrary
+    `obj.x = fn` (obj is neither this/exports/module.exports/<X>.prototype)
+    must NOT produce a node."""
+    from graphify.extract import extract_js
+    f = tmp_path / "noise.js"
+    f.write_text(
+        "const obj = {};\n"
+        "obj.whatever = () => 1;\n"
+    )
+    labels = [n["label"] for n in extract_js(f)["nodes"]]
+    assert "whatever()" not in labels
+    assert ".whatever()" not in labels
+
+
+def by_label_by_id(result, node_id):
+    for n in result["nodes"]:
+        if n["id"] == node_id:
+            return n["label"]
+    return None
+
+
 def test_cross_file_call_promoted_to_extracted_with_import_evidence(tmp_path):
     """A cross-file `calls` edge must be EXTRACTED when the caller's file has
     an `imports` or `imports_from` edge linking it to the callee."""
@@ -560,6 +689,119 @@ def test_cross_file_call_remains_inferred_without_import_evidence(tmp_path):
     ]
     assert len(call_edges) == 1
     assert call_edges[0]["confidence"] == "INFERRED"
+
+
+def test_python_qualified_class_method_call_resolves_extracted(tmp_path):
+    """`ClassName.method()` across files resolves to the class-qualified method
+    node with an EXTRACTED `calls` edge (#1446)."""
+    actions = tmp_path / "actions.py"
+    viewset = tmp_path / "viewset.py"
+    actions.write_text(
+        "class TaskActions:\n"
+        "    @staticmethod\n"
+        "    def approve(pk):\n"
+        "        return pk\n"
+    )
+    viewset.write_text(
+        "from actions import TaskActions\n\n"
+        "class TaskViewSet:\n"
+        "    def handle(self, request):\n"
+        "        return TaskActions.approve(request)\n"
+    )
+    result = extract([viewset, actions], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    call_edges = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "handle" in nodes[e["source"]]["label"]
+        and "approve" in nodes[e["target"]]["label"]
+        and "actions.py" in (nodes[e["target"]].get("source_file") or "")
+    ]
+    assert len(call_edges) == 1, f"expected one handle->approve edge, got {call_edges}"
+    assert call_edges[0]["confidence"] == "EXTRACTED"
+
+
+def test_python_qualified_call_resolves_when_method_name_collides_with_caller(tmp_path):
+    """The real #1446 shape: a viewset action `approve()` delegates to a SERVICE
+    action of the SAME name via `Service.approve()`. The bare-name in-file lookup
+    would match the caller's own node (tgt == caller) and silently drop the call;
+    the qualified receiver must still resolve it cross-file to the service method."""
+    actions = tmp_path / "actions.py"
+    viewset = tmp_path / "viewset.py"
+    actions.write_text(
+        "class TaskActions:\n"
+        "    @staticmethod\n"
+        "    def approve(pk):\n"
+        "        return pk\n"
+    )
+    viewset.write_text(
+        "from actions import TaskActions\n\n"
+        "class TaskViewSet:\n"
+        "    def approve(self, request):\n"          # same name as the callee
+        "        return TaskActions.approve(request)\n"
+    )
+    result = extract([viewset, actions], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    cross = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "viewset.py" in (nodes[e["source"]].get("source_file") or "")
+        and "actions.py" in (nodes[e["target"]].get("source_file") or "")
+        and "approve" in nodes[e["target"]]["label"]
+    ]
+    assert len(cross) == 1, f"expected viewset->service approve edge, got {cross}"
+    assert cross[0]["confidence"] == "EXTRACTED"
+
+
+def test_python_instance_member_call_not_overconnected(tmp_path):
+    """A lowercase-receiver member call (`obj.run()`, `self.run()`) must NOT be
+    resolved cross-file — the #543/#1219 god-node guard stays intact (#1446)."""
+    svc = tmp_path / "svc.py"
+    worker = tmp_path / "worker.py"
+    svc.write_text(
+        "class Service:\n"
+        "    def run(self):\n"
+        "        return 1\n"
+    )
+    worker.write_text(
+        "class Worker:\n"
+        "    def go(self, obj):\n"
+        "        return obj.run()\n"
+    )
+    result = extract([worker, svc], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    bad = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "go" in nodes[e["source"]]["label"]
+        and "run" in nodes[e["target"]]["label"]
+    ]
+    assert bad == [], f"instance member call must not connect cross-file: {bad}"
+
+
+def test_python_qualified_call_ambiguous_class_bails(tmp_path):
+    """When the class name is defined in 2+ files, the qualified call must not
+    resolve — single-definition god-node guard (#1446)."""
+    a = tmp_path / "a.py"
+    b = tmp_path / "b.py"
+    caller = tmp_path / "caller.py"
+    a.write_text("class Helper:\n    def do(self):\n        return 1\n")
+    b.write_text("class Helper:\n    def do(self):\n        return 2\n")
+    caller.write_text(
+        "from a import Helper\n\n"
+        "class C:\n"
+        "    def f(self):\n"
+        "        return Helper.do(self)\n"
+    )
+    result = extract([caller, a, b], cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    resolved = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and "f" == nodes[e["source"]]["label"].strip("().")
+        and "do" in nodes[e["target"]]["label"]
+    ]
+    assert resolved == [], f"ambiguous class name must not resolve: {resolved}"
 
 
 # ── TSX (JSX-aware) parsing ──────────────────────────────────────────────────
