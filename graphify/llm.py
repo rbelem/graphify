@@ -1856,7 +1856,10 @@ def _call_llm(
         except ImportError as exc:
             raise ImportError(_backend_pkg_hint("anthropic", "anthropic")) from exc
         client = anthropic.Anthropic(
-            api_key=key, base_url=cfg["base_url"], max_retries=_resolve_max_retries()
+            api_key=key,
+            base_url=cfg["base_url"],
+            timeout=_resolve_api_timeout(),
+            max_retries=_resolve_max_retries(),
         )
         resp = client.messages.create(
             model=mdl,
@@ -1938,7 +1941,12 @@ def _call_llm(
         from openai import OpenAI
     except ImportError as exc:
         raise ImportError(_backend_pkg_hint("openai", "openai")) from exc
-    client = OpenAI(api_key=key, base_url=cfg["base_url"], max_retries=_resolve_max_retries())
+    client = OpenAI(
+        api_key=key,
+        base_url=cfg["base_url"],
+        timeout=_resolve_api_timeout(),
+        max_retries=_resolve_max_retries(),
+    )
     kwargs: dict = {
         "model": mdl,
         "messages": [{"role": "user", "content": prompt}],

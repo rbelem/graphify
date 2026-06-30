@@ -2992,11 +2992,16 @@ def main() -> None:
 
         p = _ap.ArgumentParser(prog="graphify save-result")
         p.add_argument("--question", required=True)
-        p.add_argument("--answer", required=True)
+        p.add_argument("--answer", default=None)
+        p.add_argument("--answer-file", dest="answer_file", default=None)
         p.add_argument("--type", dest="query_type", default="query")
         p.add_argument("--nodes", nargs="*", default=[])
         p.add_argument("--memory-dir", default="graphify-out/memory")
         opts = p.parse_args(sys.argv[2:])
+        if opts.answer_file:
+            opts.answer = Path(opts.answer_file).read_text(encoding="utf-8").strip()
+        elif not opts.answer:
+            p.error("--answer or --answer-file is required")
         from graphify.ingest import save_query_result as _sqr
 
         out = _sqr(
@@ -4774,6 +4779,7 @@ def main() -> None:
         # Semantic extraction on docs/papers/images. Check cache first.
         from graphify.cache import (
             check_semantic_cache as _check_semantic_cache,
+            prune_semantic_cache as _prune_semantic_cache,
             save_semantic_cache as _save_semantic_cache,
         )
 
@@ -4883,6 +4889,36 @@ def main() -> None:
                 sem_result["hyperedges"].extend(fresh.get("hyperedges", []))
                 sem_result["input_tokens"] += fresh.get("input_tokens", 0)
                 sem_result["output_tokens"] += fresh.get("output_tokens", 0)
+
+        # Prune orphaned semantic cache entries. The semantic cache is
+        # content-hash-keyed and unversioned, so it is never swept by the AST
+        # version-cleanup: every content change or file deletion leaves a
+        # permanent orphan that accumulates unbounded (#1527). Sweep it against
+        # the FULL live document set (``files_by_type`` — present in both the
+        # incremental and full branches), NOT the incremental ``semantic_files``
+        # changed-subset, which would delete every unchanged doc's valid entry.
+        # Best-effort: a prune failure must never break extraction.
+        try:
+            from graphify.cache import file_hash as _file_hash
+
+            _live_hashes: set[str] = set()
+            for _kind in ("document", "paper", "image"):
+                for _fp in files_by_type.get(_kind, []):
+                    _abs = Path(_fp)
+                    if not _abs.is_absolute():
+                        _abs = Path(out_root) / _abs
+                    if not _abs.is_file():
+                        continue  # deleted/missing — leave out so its entry is pruned
+                    try:
+                        _live_hashes.add(_file_hash(_abs, out_root))
+                    except OSError:
+                        pass
+            _prune_semantic_cache(out_root, _live_hashes)
+        except Exception as exc:
+            print(
+                f"[graphify extract] warning: could not prune semantic cache: {exc}",
+                file=sys.stderr,
+            )
         stages.mark("semantic extract")
 
         pg_result: dict = {"nodes": [], "edges": []}
