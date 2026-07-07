@@ -362,6 +362,32 @@ def test_collect_files_follows_symlinked_directory(tmp_path):
     assert [f.name for f in files_yes].count("lib.py") == 2
 
 
+def test_collect_files_skips_out_of_root_symlinked_directory(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("token = 'outside'")
+    (root / "linked_secret").symlink_to(outside)
+
+    files = collect_files(root, follow_symlinks=True)
+
+    assert not any("linked_secret" in str(f) for f in files)
+
+
+def test_collect_files_skips_out_of_root_symlinked_file_by_default(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("token = 'outside'")
+    (root / "secret_link.py").symlink_to(outside / "secret.py")
+
+    files = collect_files(root)
+
+    assert not any(f.name == "secret_link.py" for f in files)
+
+
 def test_collect_files_handles_circular_symlinks(tmp_path):
     sub = tmp_path / "pkg"
     sub.mkdir()
@@ -382,7 +408,8 @@ def _legacy_collect_files(target, *, root=None):
     for ext in sorted(extensions):
         results.extend(
             p for p in target.rglob(f"*{ext}")
-            if not any(_is_noise_dir(part) for part in p.parts)
+            if p.suffix == ext
+            and not any(_is_noise_dir(part) for part in p.parts)
             and not (patterns and _is_ignored(p, ignore_root, patterns))
         )
     return sorted(results)
@@ -556,6 +583,91 @@ def test_cross_file_calls_skip_ambiguous_duplicate_labels(tmp_path):
         nodes[e["source"]]["label"] == "run()" and nodes[e["target"]]["label"] == "log()"
         for e in calls
     )
+
+
+def test_cross_file_call_survives_same_named_test_mock(tmp_path):
+    """A real cross-file call must NOT be erased by a same-named test mock.
+
+    src/caller.py calls save(); src/service.py defines the real save(); a test
+    mock save() lives in tests/test_service.py. Before #1553 the ambiguous-name
+    god-node guard dropped the edge entirely. Now the non-test tie-breaker keeps
+    exactly one caller->save edge pointing at the SRC definition.
+    """
+    src = tmp_path / "src"
+    tests = tmp_path / "tests"
+    src.mkdir()
+    tests.mkdir()
+    (src / "service.py").write_text("def save():\n    return 'real'\n")
+    (src / "caller.py").write_text("def run():\n    save()\n")
+    (tests / "test_service.py").write_text("def save():\n    return 'mock'\n")
+
+    result = extract(
+        [src / "caller.py", src / "service.py", tests / "test_service.py"],
+        cache_root=tmp_path,
+    )
+    nodes = {n["id"]: n for n in result["nodes"]}
+    save_calls = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and nodes[e["source"]]["label"] == "run()"
+        and nodes[e["target"]]["label"] == "save()"
+    ]
+    assert len(save_calls) == 1, f"expected exactly one run->save edge, got {save_calls}"
+    target_sf = (nodes[save_calls[0]["target"]].get("source_file") or "")
+    assert "service.py" in target_sf and "test_service.py" not in target_sf, target_sf
+
+
+def test_cross_file_call_god_node_guard_two_real_defs(tmp_path):
+    """Two genuine NON-test defs of the same name + one caller => ZERO edges.
+
+    Proves #543/#1219 is not reopened by the #1553 tie-breakers: with no test
+    candidate to drop and no proximity winner, the guard still bails.
+    """
+    pkg_a = tmp_path / "a"
+    pkg_b = tmp_path / "b"
+    pkg_c = tmp_path / "c"
+    for d in (pkg_a, pkg_b, pkg_c):
+        d.mkdir()
+    (pkg_a / "svc.py").write_text("def save():\n    return 'a'\n")
+    (pkg_b / "svc.py").write_text("def save():\n    return 'b'\n")
+    (pkg_c / "caller.py").write_text("def run():\n    save()\n")
+
+    result = extract(
+        [pkg_c / "caller.py", pkg_a / "svc.py", pkg_b / "svc.py"],
+        cache_root=tmp_path,
+    )
+    nodes = {n["id"]: n for n in result["nodes"]}
+    save_calls = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and nodes[e["source"]]["label"] == "run()"
+        and nodes[e["target"]]["label"] == "save()"
+    ]
+    assert save_calls == [], f"god-node guard must bail, got {save_calls}"
+
+
+def test_cross_file_call_survives_many_test_mocks(tmp_path):
+    """One src def + many same-named test stubs + caller => exactly one src edge."""
+    src = tmp_path / "src"
+    tests = tmp_path / "tests"
+    src.mkdir()
+    tests.mkdir()
+    (src / "service.py").write_text("def save():\n    return 'real'\n")
+    (src / "caller.py").write_text("def run():\n    save()\n")
+    for i in range(5):
+        (tests / f"thing{i}_test.py").write_text("def save():\n    return 'mock'\n")
+
+    paths = [src / "caller.py", src / "service.py"] + sorted(tests.glob("*_test.py"))
+    result = extract(paths, cache_root=tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+    save_calls = [
+        e for e in result["edges"]
+        if e["relation"] == "calls"
+        and nodes[e["source"]]["label"] == "run()"
+        and nodes[e["target"]]["label"] == "save()"
+    ]
+    assert len(save_calls) == 1, f"expected one run->save edge, got {save_calls}"
+    assert "service.py" in (nodes[save_calls[0]["target"]].get("source_file") or "")
 
 
 def test_extract_generic_surfaces_tree_sitter_version_mismatch_hint(monkeypatch):
@@ -768,9 +880,11 @@ def test_cross_file_call_promoted_to_extracted_with_import_evidence(tmp_path):
     assert call_edges[0]["confidence_score"] == 1.0
 
 
-def test_cross_file_call_remains_inferred_without_import_evidence(tmp_path):
-    """A cross-file `calls` edge must stay INFERRED when there is no import
-    edge — name collision alone is insufficient evidence."""
+def test_js_cross_file_call_without_import_emits_no_edge(tmp_path):
+    """A JS/TS call with no local definition and no import must NOT bind to a
+    same-named export in another file (#1659). JS/TS modules have no implicit
+    cross-module scope, so name collision alone is not a real call — it used to
+    produce a phantom INFERRED edge that fabricated cross-package dependencies."""
     caller = tmp_path / "caller.js"
     callee = tmp_path / "lib.js"
     # Caller does NOT require lib — same-name function happens to exist elsewhere
@@ -787,8 +901,7 @@ def test_cross_file_call_remains_inferred_without_import_evidence(tmp_path):
         and nodes[e["source"]]["label"] == "run()"
         and nodes[e["target"]]["label"] == "doUnique()"
     ]
-    assert len(call_edges) == 1
-    assert call_edges[0]["confidence"] == "INFERRED"
+    assert call_edges == [], f"unimported cross-file JS call should not resolve: {call_edges}"
 
 
 def test_python_qualified_class_method_call_resolves_extracted(tmp_path):
@@ -1471,6 +1584,56 @@ def test_extract_json_via_dispatch():
     assert _get_extractor(Path("foo.json")) is extract_json
 
 
+def test_extensionless_shebang_via_dispatch(tmp_path):
+    """Extensionless CLIs resolve their extractor from the shebang, mirroring
+    detect.classify_file — otherwise detect labels them code and extraction
+    silently drops them."""
+    from graphify.extract import _get_extractor
+
+    cli = tmp_path / "devctl"
+    cli.write_text("#!/usr/bin/env bash\necho hi\n")
+    assert _get_extractor(cli) is extract_bash
+
+    pytool = tmp_path / "manage"
+    pytool.write_text("#!/usr/bin/env python3\nprint('hi')\n")
+    assert _get_extractor(pytool) is extract_python
+
+    # env -S split-args form is handled by the shared shebang parser
+    split = tmp_path / "runner"
+    split.write_text("#!/usr/bin/env -S bash -eu\necho hi\n")
+    assert _get_extractor(split) is extract_bash
+
+
+def test_extensionless_without_usable_shebang_stays_unsupported(tmp_path):
+    from graphify.extract import _get_extractor
+
+    plain = tmp_path / "LICENSE-COPY"
+    plain.write_text("plain text, no shebang\n")
+    assert _get_extractor(plain) is None
+
+    # Interpreter known to detect but with no AST extractor: stays skipped
+    # rather than being mis-parsed by a wrong grammar.
+    perl = tmp_path / "legacy"
+    perl.write_text("#!/usr/bin/env perl\nprint 1;\n")
+    assert _get_extractor(perl) is None
+
+
+def test_extract_extensionless_bash_cli_end_to_end(tmp_path):
+    """A shebang-only bash CLI must contribute nodes with the same ID scheme
+    as a .sh file (path stem + entity), so doc-created stub IDs merge."""
+    cli = tmp_path / "devctl"
+    cli.write_text(
+        "#!/usr/bin/env bash\n"
+        "helper() { echo hi; }\n"
+        "main() { helper; }\n"
+        'main "$@"\n'
+    )
+    result = extract([cli], cache_root=tmp_path)
+    ids = {n["id"] for n in result["nodes"]}
+    assert "devctl_helper" in ids
+    assert "devctl_main" in ids
+
+
 def test_extract_bash_node_metadata_is_sanitized():
     """Bash extractor must route node metadata through sanitize_metadata so
     HTML-sensitive characters cannot reach downstream graph viewers raw."""
@@ -1651,3 +1814,28 @@ def test_non_colliding_path_id_is_not_salted(tmp_path):
     result = extract([p], cache_root=tmp_path)
     file_id = next(n["id"] for n in result["nodes"] if n.get("source_location") == "L1")
     assert file_id == make_id(_file_stem(Path("src/auth/session.py"))) == "src_auth_session"
+
+
+def test_case_insensitive_suffix_filtering(tmp_path):
+    py_file = tmp_path / "app.PY"
+    js_file = tmp_path / "script.JS"
+    ts_file = tmp_path / "lib.Ts"
+    
+    py_file.write_text("class MyPythonClass:\n    pass\n")
+    js_file.write_text("function myJSFunction() {}\n")
+    ts_file.write_text("export class MyTSClass {}\n")
+    
+    collected = collect_files(tmp_path)
+    collected_names = {f.name for f in collected}
+    assert "app.PY" in collected_names
+    assert "script.JS" in collected_names
+    assert "lib.Ts" in collected_names
+
+    result = extract(collected, cache_root=tmp_path)
+    nodes = result["nodes"]
+    labels = {n.get("label") for n in nodes if "label" in n}
+    
+    assert "MyPythonClass" in labels
+    assert "myJSFunction()" in labels
+    assert "MyTSClass" in labels
+
