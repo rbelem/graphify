@@ -2493,6 +2493,95 @@ def _resolve_csharp_member_calls(
         })
 
 
+def _resolve_java_member_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Java member calls against the receiver's declared type.
+
+    Explicit type receivers and ``this`` are exact. Fields declared on the
+    caller's class plus method parameters and explicit locals are inferred from
+    the extractor's method-scoped type table. A missing or ambiguous receiver
+    type is skipped rather than falling back to a bare method-name match.
+    """
+    def key(label: str) -> str:
+        return str(label).strip().removeprefix(".").removesuffix("()")
+
+    contained = {edge.get("target") for edge in all_edges
+                 if edge.get("relation") == "contains"}
+    node_by_id = {node.get("id"): node for node in all_nodes}
+
+    type_def_nids: dict[str, list[str]] = {}
+    for node in all_nodes:
+        if (
+            node.get("source_file")
+            and node.get("id") in contained
+            and _is_type_like_definition(node)
+        ):
+            type_def_nids.setdefault(key(node.get("label", "")), []).append(node["id"])
+
+    method_index: dict[tuple[str, str], set[str]] = {}
+    enclosing_type: dict[str, str] = {}
+    for edge in all_edges:
+        if edge.get("relation") != "method":
+            continue
+        owner, method = edge.get("source"), edge.get("target")
+        method_node = node_by_id.get(method)
+        if method_node is None:
+            continue
+        enclosing_type.setdefault(method, owner)
+        method_index.setdefault((owner, key(method_node.get("label", ""))), set()).add(method)
+
+    existing_pairs = {(edge.get("source"), edge.get("target")) for edge in all_edges}
+    for result in per_file:
+        for raw_call in result.get("raw_calls", []):
+            if raw_call.get("lang") != "java" or not raw_call.get("is_member_call"):
+                continue
+            receiver = raw_call.get("receiver")
+            callee = raw_call.get("callee")
+            caller = raw_call.get("caller_nid")
+            if not receiver or not callee or not caller:
+                continue
+
+            exact = False
+            if receiver == "this":
+                type_nid = enclosing_type.get(caller)
+                exact = True
+                if not type_nid:
+                    continue
+            else:
+                type_name = raw_call.get("receiver_type")
+                if not type_name and receiver[:1].isupper():
+                    type_name = receiver
+                    exact = True
+                if not type_name:
+                    continue
+                type_defs = type_def_nids.get(key(type_name), [])
+                if len(type_defs) != 1:
+                    continue
+                type_nid = type_defs[0]
+
+            method_nids = method_index.get((type_nid, key(callee)), set())
+            if len(method_nids) != 1:
+                continue
+            method_nid = next(iter(method_nids))
+            if method_nid == caller or (caller, method_nid) in existing_pairs:
+                continue
+            existing_pairs.add((caller, method_nid))
+            all_edges.append({
+                "source": caller,
+                "target": method_nid,
+                "relation": "calls",
+                "context": "call",
+                "confidence": "EXTRACTED" if exact else "INFERRED",
+                "confidence_score": 1.0 if exact else 0.8,
+                "source_file": raw_call.get("source_file", ""),
+                "source_location": raw_call.get("source_location"),
+                "weight": 1.0,
+            })
+
+
 def _resolve_objc_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -2642,6 +2731,9 @@ register_language_resolver(
 # bound to the receiver's declared type instead of a bare same-named match.
 register_language_resolver(
     LanguageResolver("csharp_member_calls", frozenset({".cs"}), _resolve_csharp_member_calls)
+)
+register_language_resolver(
+    LanguageResolver("java_member_calls", frozenset({".java"}), _resolve_java_member_calls)
 )
 # Pascal/Delphi cross-file inherited-method-call resolution: a call from a
 # manual descendant class to a method it inherits from an ancestor declared
@@ -2807,7 +2899,6 @@ def _check_tree_sitter_version() -> None:
         )
 
 
-<<<<<<< HEAD
 def extract_perl(path: Path) -> dict:
     """Extract packages, subs, use/require imports, and calls from a .pl/.pm file via tree-sitter."""
     try:
@@ -3011,230 +3102,6 @@ def extract_perl(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
 
 
-def extract_bash(path: Path) -> dict:
-    """Extract functions, source imports, and cross-function calls from a .sh file."""
-    try:
-        import tree_sitter_bash as tsbash
-        from tree_sitter import Language, Parser
-    except ImportError:
-        return {"nodes": [], "edges": [], "error": "tree-sitter-bash not installed"}
-
-    try:
-        language = Language(tsbash.language())
-        parser = Parser(language)
-        source = path.read_bytes()
-        tree = parser.parse(source)
-        root = tree.root_node
-    except Exception as e:
-        return {"nodes": [], "edges": [], "error": str(e)}
-
-    stem = _file_stem(path)
-    str_path = str(path)
-    nodes: list[dict] = []
-    edges: list[dict] = []
-    seen_ids: set[str] = set()
-    function_bodies: list[tuple[str, Any]] = []
-    defined_functions: set[str] = set()
-
-    from graphify.security import sanitize_metadata  # module-level cached import
-
-    def add_node(nid: str, label: str, line: int, kind: str = "code") -> None:
-        if nid and nid not in seen_ids:
-            seen_ids.add(nid)
-            nodes.append({"id": nid, "label": label, "file_type": "code",
-                          "source_file": str_path, "source_location": f"L{line}",
-                          "metadata": sanitize_metadata({"language": "bash", "kind": kind})})  # noqa: E501
-
-    def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0,
-                 context: str | None = None) -> None:
-        if not src or not tgt or src == tgt:
-            return
-        edge = {"source": src, "target": tgt, "relation": relation,
-                "confidence": confidence, "source_file": str_path,
-                "source_location": f"L{line}", "weight": weight}
-        if context:
-            edge["context"] = context
-        edges.append(edge)
-
-    file_nid = _make_id(str(path))
-    # file_nid is fully path-derived and never produced by _make_id(stem, func_name),
-    # so appending "__entry" guarantees a distinct ID from any function node.
-    entry_nid = file_nid + "__entry"
-    add_node(file_nid, path.name, 1, kind="file")
-    add_node(entry_nid, f"{path.name} script", 1, kind="bash_entrypoint")
-    add_edge(file_nid, entry_nid, "contains", 1)
-
-    _BASH_SOURCE_COMMANDS = frozenset({"source", "."})
-    # Parent node types that mean a contained command is part of a substitution
-    # or expansion, not a real function call. Token-level filtering misses
-    # these because `$(build)` exposes `build` as a child command whose name
-    # token has no metacharacters — only the parent does.
-    _BASH_EXPANSION_PARENTS = frozenset({
-        "command_substitution",
-        "process_substitution",
-    })
-
-    def text(node) -> str:
-        return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
-
-    def is_inside_expansion(node) -> bool:
-        parent = node.parent
-        while parent is not None:
-            if parent.type in _BASH_EXPANSION_PARENTS:
-                return True
-            parent = parent.parent
-        return False
-
-    def literal(node) -> str | None:
-        # Token-level filter: rejects names containing shell metacharacters.
-        # Combined with `is_inside_expansion` for parent-context rejection.
-        raw = text(node).strip()
-        if not raw:
-            return None
-        if raw[0:1] in {"'", '"'} and raw[-1:] == raw[0]:
-            raw = raw[1:-1]
-        if any(token in raw for token in ("$", "`", "$(", "<(", ">", "|", ";", "&")):
-            return None
-        return raw
-
-    def _bash_func_name(node) -> str | None:
-        """Get the name from a function_definition node."""
-        # bash grammar: function_definition has a word child (the name)
-        for child in node.children:
-            if child.type == "word":
-                return literal(child)
-        return None
-
-    def walk_calls(body_node, func_nid: str, seen_calls: set) -> None:
-        if body_node is None:
-            return
-        for child in body_node.children:
-            if child.type == "function_definition":
-                # Skip nested function definitions — their bodies are walked
-                # separately, so we don't attribute their calls to the
-                # enclosing scope.
-                continue
-            if child.type == "command" and not is_inside_expansion(child):
-                cmd_name_node = child.child_by_field_name("name")
-                if cmd_name_node is None and child.children:
-                    cmd_name_node = child.children[0]
-                if cmd_name_node:
-                    name = literal(cmd_name_node)
-                    # Defined-functions wins. Skip-lists for external commands
-                    # would create false negatives when a user defines a
-                    # function shadowing an external (`install`, `find`, etc.).
-                    if name and name in defined_functions:
-                        tgt = _make_id(stem, name)
-                        key = (func_nid, tgt)
-                        if tgt and key not in seen_calls:
-                            seen_calls.add(key)
-                            add_edge(func_nid, tgt, "calls",
-                                     child.start_point[0] + 1,
-                                     confidence="EXTRACTED", context="call")
-            walk_calls(child, func_nid, seen_calls)
-
-    def walk(node, parent_nid: str) -> None:
-        t = node.type
-        if t == "function_definition":
-            name = _bash_func_name(node)
-            if name:
-                fn_nid = _make_id(stem, name)
-                line = node.start_point[0] + 1
-                add_node(fn_nid, f"{name}()", line, kind="bash_function")
-                add_edge(parent_nid, fn_nid, "defines", line)
-                defined_functions.add(name)
-                # find the compound_statement body
-                body = None
-                for child in node.children:
-                    if child.type == "compound_statement":
-                        body = child
-                        break
-                function_bodies.append((fn_nid, body))
-                # Recurse into the body so nested function definitions are discovered
-                # and added to function_bodies for the second-pass walk_calls.
-                if body is not None:
-                    walk(body, fn_nid)
-            return
-
-        if t == "command":
-            if is_inside_expansion(node):
-                return
-            cmd_name_node = node.child_by_field_name("name")
-            if cmd_name_node is None and node.children:
-                cmd_name_node = node.children[0]
-            if cmd_name_node:
-                cmd = literal(cmd_name_node)
-                if cmd in _BASH_SOURCE_COMMANDS and cmd not in defined_functions:
-                    # find the path argument (first word after command name)
-                    args = [c for c in node.children
-                            if c.type in ("word", "string", "concatenation")
-                            and c != cmd_name_node]
-                    if args:
-                        raw = _read_text(args[0], source).strip().strip("'\"")
-                        line = node.start_point[0] + 1
-                        if raw.startswith((".", "/")):
-                            resolved = (path.parent / raw).resolve()
-                            # Only emit the edge if the target actually exists on
-                            # disk — prevents graph pollution from crafted paths
-                            # like `source ../../etc/passwd` that traverse outside
-                            # the project tree (B-1).
-                            if resolved.exists():
-                                tgt_nid = _make_id(str(resolved))
-                                add_edge(file_nid, tgt_nid, "imports_from", line,
-                                         context="import")
-                        else:
-                            tgt_nid = _make_id(raw)
-                            if tgt_nid:
-                                add_edge(file_nid, tgt_nid, "imports", line,
-                                         context="import")
-            return
-
-        if t == "declaration_command":
-            # export/declare/readonly VAR=value at program level
-            if node.parent and node.parent.type == "program":
-                for child in node.children:
-                    if child.type == "variable_assignment":
-                        var_node = child.child_by_field_name("name")
-                        if var_node:
-                            var = _read_text(var_node, source).strip()
-                            if var:
-                                var_nid = _make_id(stem, var)
-                                line = child.start_point[0] + 1
-                                add_node(var_nid, var, line)
-                                add_edge(file_nid, var_nid, "defines", line)
-            return
-
-        for child in node.children:
-            walk(child, parent_nid)
-
-    # Pre-pass: collect all defined function names so the source-command handler
-    # in walk() can detect user-defined functions that shadow 'source' / '.'
-    # regardless of definition order in the file.
-    def _prescan_functions(node) -> None:
-        if node.type == "function_definition":
-            name = _bash_func_name(node)
-            if name:
-                defined_functions.add(name)
-            for child in node.children:
-                _prescan_functions(child)
-        else:
-            for child in node.children:
-                _prescan_functions(child)
-
-    _prescan_functions(root)
-    walk(root, file_nid)
-
-    # Second pass: cross-function calls
-    top_seen: set = set()
-    walk_calls(root, entry_nid, top_seen)  # top-level calls attributed to the entrypoint
-    for fn_nid, body in function_bodies:
-        walk_calls(body, fn_nid, set())
-
-    return {"nodes": nodes, "edges": edges}
-
-
-||||||| 53efaf8
 def extract_bash(path: Path) -> dict:
     """Extract functions, source imports, and cross-function calls from a .sh file."""
     try:
@@ -4395,6 +4262,20 @@ _DISPATCH: dict[str, Any] = {
 }
 
 
+# Extensions whose extractor depends on an optional-dependency extra
+# (pyproject [project.optional-dependencies]) and hard-fails without it,
+# rather than falling back like Pascal does. Used by the #1745 warning in
+# extract() to tell the user which extra restores the language.
+_EXTRA_FOR_EXTENSION = {
+    ".sql": "sql",
+    ".tf": "terraform",
+    ".tfvars": "terraform",
+    ".hcl": "terraform",
+    ".dm": "dm",
+    ".dme": "dm",
+}
+
+
 # Extensionless executables (CLI entry points like `devctl` or `manage`) carry
 # their language in the shebang, not the suffix. detect.classify_file already
 # routes them to the CODE path via _shebang_interpreter; _get_extractor must
@@ -4851,6 +4732,35 @@ def extract(
             f"  warning: {_tot} file(s) are classified as code but graphify has no AST "
             f"extractor for their language, so they contributed nothing to the graph: "
             f"{_by_count}. Please open an issue to request support for these (#1689).",
+            file=sys.stderr, flush=True,
+        )
+
+    # #1745: an extractor IS wired up for these files but bailed out because its
+    # dependency is missing (e.g. .sql needs tree-sitter-sql from the [sql]
+    # extra). Neither warning above fires — #1666 skips results that carry an
+    # error, #1689 only covers files with no extractor — so the graph builds
+    # "successfully" while every such file silently contributes nothing.
+    # Surface them grouped by extension, naming the extra that provides the
+    # dependency when there is one.
+    _missing_dep_count: dict[str, int] = {}
+    _missing_dep_error: dict[str, str] = {}
+    for i, _p in enumerate(paths):
+        _err = (per_file[i] or {}).get("error") or ""
+        if "not installed" in _err:
+            _ext = _p.suffix.lower()
+            _missing_dep_count[_ext] = _missing_dep_count.get(_ext, 0) + 1
+            _missing_dep_error.setdefault(_ext, _err)
+    for _ext, _n in sorted(_missing_dep_count.items(), key=lambda kv: (-kv[1], kv[0])):
+        _extra = _EXTRA_FOR_EXTENSION.get(_ext)
+        if _extra:
+            _reason = _missing_dep_error[_ext].split(". ")[0]
+            _hint = f' Install it with: pip install "graphifyy[{_extra}]"'
+        else:
+            _reason = _missing_dep_error[_ext]
+            _hint = ""
+        print(
+            f"  warning: {_n} {_ext} file(s) contributed nothing to the graph "
+            f"because a dependency is missing: {_reason}.{_hint} (#1745)",
             file=sys.stderr, flush=True,
         )
 
