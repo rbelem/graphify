@@ -2,7 +2,38 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
-## 0.9.39 (unreleased)
+## 0.9.41 (unreleased)
+
+- Fix: a JS/TS `catch` binding passed as a call argument (`catch (handler) { pool.submit(handler) }`) no longer fabricates an `indirect_call` edge to an unrelated same-named callable (thanks @imagineers-tyler); the catch binding is now shadowed within its clause, completing the 0.9.38/0.9.40 arrow-parameter fixes (#2568).
+- Fix: `Cargo.toml` is now recognized as a package manifest (#2434, thanks @ousamabenyounes), minting one canonical package node by name plus `depends_on` edges (dependencies, plus target-specific deps; virtual-workspace roots and workspace-inherited versions are handled).
+- Fix: an explicitly-passed scan root is no longer excluded by an unanchored pattern in a parent-directory `.gitignore` that happens to match the root's own name (#2468, thanks @hopstreax); the match path is re-relativized to the scan root (and NFC-normalized) so a genuinely-ignored subdirectory is still skipped.
+- Fix: the API extraction prompt now instructs backends to capture the per-node `rationale` attribute (design intent / trade-offs), matching the skill path, so API-backed extraction no longer silently drops it (#2482, thanks @hopstreax). This invalidates cached semantic chunks, which re-extract on the next run.
+- Fix: `source_file` is canonicalized to POSIX separators, so a run given relative inputs on Windows no longer produces non-portable node ids with backslashes (#2627, thanks @rajarshidattapy).
+- Fix: a warm cache hit no longer re-anchors a CWD-relative `source_file` to a ghost path when the run's working directory differs from the graph root, keeping incremental and cold-build node ids identical (#2632, thanks @rajarshidattapy).
+- Fix: the wiki/obsidian audit trail counts each incident edge once instead of double-counting intra-community edges, so the confidence breakdown is accurate (#2635, thanks @rajarshidattapy).
+- Fix: C# members declared inside a `#if ... #endif` preprocessor block are now extracted and attached to their class instead of being dropped (#2634, thanks @rohit-jsfreaky).
+- Fix: `graphify update` refuses to overwrite the graph with a shrunken one when the shrink was caused by an extractor failure this run, instead of silently replacing good data (#2663, thanks @ousamabenyounes); a genuine deletion still shrinks the graph.
+- Fix: `query` no longer prints the truncation banner when no nodes were actually cut (only trailing edges overflowed the budget) (#2601, thanks @ousamabenyounes); a genuine node truncation still warns.
+- Fix: a PHP `use` import written with a leading-backslash / fully-qualified prefix now resolves to its target definition instead of being dropped (#2661, thanks @ousamabenyounes).
+- Fix: an unresolved local JS/TS import (to a file absent from the scan) now emits a stable, portable `ref` target id instead of leaking a per-checkout absolute-path slug (#2457, thanks @rohit-jsfreaky).
+- Fix: `graphify benchmark` no longer crashes on a node whose label is `None` (#2674, thanks @Arthuro0103).
+
+## 0.9.40 (2026-08-11)
+
+- Fix: the 0.9.37 partial-parse warning no longer fires on valid TypeScript/TSX (#2610, #2599, thanks @Sid-AutoWisdom and @atlasplatformu-ai). tree-sitter-typescript sets an error flag on tiny fully-recovered constructs (a `&` in a JSX string attribute, a semicolon-less `in_*` interface member) that still extract completely; the warning now fires only when recovery plausibly cost symbols (the file yielded at most the file node, or an error region spans multiple lines), so the genuine Kotlin one-line-body and Luau cases still warn.
+- Fix: `file_hash()`'s stat fastpath no longer serves a stale digest when a file is rewritten to the same size within one mtime tick (#2612, thanks @rajarshidattapy); a racily-clean guard falls back to a content hash for recently-modified files.
+- Fix: stored-path absoluteness is now detected cross-platform, so a POSIX-absolute `source_file` from a Linux/CI-built graph no longer leaks into node ids on Windows (#2618, thanks @rajarshidattapy).
+- Fix: `normalize_id()` is now idempotent for Turkish `İ` and similar codepoints by casefolding before the non-word filter; no ASCII identifier ids change (#2614, thanks @rajarshidattapy).
+- Fix: `graph.json` collection order is now deterministic across runs (#2582, thanks @hjotha).
+- Fix: `explain`/`_find_node` resolve node ids containing punctuation or non-ASCII characters (#2467, thanks @sean-soomgo).
+- Fix: `.graphifyignore` patterns match paths regardless of Unicode NFC/NFD normalization, so an accented ignore rule works on macOS (#2544, thanks @bruno-growthsales).
+- Fix: Obsidian vault metadata directories (`.obsidian`, `.smart-env`) are skipped during detection (#2493, thanks @rohit-jsfreaky).
+- Fix: a single unparenthesised arrow parameter (`x => f(x)`) is now shadowed, so it no longer fabricates an `indirect_call` edge to an unrelated same-named callable (thanks @imagineers-tyler); follows the 0.9.38 sibling-closure fix (#2568).
+- Fix: Python extraction no longer crashes resolving an over-deep relative import (`from ....x import y` above the package root) (#2605, thanks @SinghAman21).
+- Fix: a Go qualified type (`pkg.Type`) resolves by import path instead of losing the qualifier and binding by bare name to an unrelated same-named symbol (#2608, thanks @gnukeno).
+- Fix: `graph.html`'s document title no longer embeds the generator's absolute host path (#2598, thanks @michaelxer); it keeps the path from the output-dir marker onward.
+
+## 0.9.39 (2026-08-10)
 
 - Fix: `affected` now traverses a dynamic `import('…')` made inside a function or at module scope (#2584, thanks @phudayyy). The 0.9.38 dedupe keyed only on the target, so an in-function dynamic import (whose symbol-level edge is anchored on the enclosing function) suppressed the file-level edge `affected` follows; the dedupe now keys on the importing file, emitting one file-level `dynamic_import` edge per file/target while keeping the call-site edge.
 - Fix: a Python member call on an untyped receiver (`x.get(...)`) no longer binds by name alone to a same-named module-level function, fabricating a false high-confidence `calls` edge and a god node (#2417, #2586, thanks @EZZEASY). Such a call is now resolved only with receiver-type, import, or `self`/`cls`/`super` evidence, matching the TypeScript fix from 0.9.37; `super().method()` still resolves.
@@ -17,6 +48,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 - Fix: Swift receiver-type inference now handles `@Environment(Store.self)` properties and factory-initialised bindings (#2561, thanks @fakewaffle). A member call on a receiver typed only through an `@Environment(Type.self)` attribute, or bound to an in-corpus factory whose return type is known (`let x = ServiceFactory.make()`), now resolves. Ambiguous or non-concrete returns (opaque `some P`, arrays, out-of-corpus) stay unresolved rather than guessing.
 - Fix: the SQL extractor no longer emits a `reads_from` edge to a CTE name (#2577, thanks @wilyan09007). A `WITH cte AS (...)` name is scoped to its query and is no longer treated as a table, so it no longer mints a bare stub that could bind to an unrelated same-named symbol; an outer real table sharing a subquery-CTE's name still resolves.
 - Fix: a dynamic `await import('…')` inside a nested function or at module scope now produces an edge (#2575, thanks @phudayyy), and `dynamic_import` edges are now included in `affected`. Calls inside a nested named function are also collected now. A dynamic import already captured as a deferred `imports_from` is not double-counted.
+- Fix: `explain` resolves node ids that contain punctuation or non-ASCII text (#2467). An id was only ever compared against the `\w+`-tokenized query, so `concept:domain:x`, every `merge-graphs` `<repo>::` id, and every Hangul id failed to resolve; the id printed by `explain` could not be fed back into `explain`, and the ambiguity hint "Retry with […] the full node id" named a remedy that could not work. The exact tier now also compares the diacritic-folded id, and the trigram index carries the folded form so a non-ASCII id survives the prefilter. Only ids that previously failed to resolve can now resolve — label queries are unchanged, and an all-ASCII graph indexes byte-identically to before.
 
 ## 0.9.37 (2026-08-08)
 
