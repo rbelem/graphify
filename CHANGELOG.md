@@ -2,7 +2,30 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
-## 0.9.58 (unreleased)
+## 0.9.61 (unreleased)
+
+- Fix: `graphify.serve` now imports cleanly on Python 3.12 and 3.13. The `chinese` extra pins `jieba-py` from 3.12 onward (0.9.60 mistakenly kept the old `jieba` until 3.14, and its invalid regex escapes are a hard error on 3.12+), and the jieba import now suppresses the tokenizer's `SyntaxWarning` regardless of message or line so it never escalates under `-W error`.
+- Fix: the git hook's rebuild-root guard now rejects a symlink-loop or dangling `.graphify_root` on Python 3.13, whose `Path.resolve()` no longer raises on a loop — the saved root must resolve to a real directory inside the repo before it is adopted.
+
+## 0.9.60 (2026-09-12)
+
+- Fix: atomic writes now fall back correctly on Windows `WinError 17` (cannot move to a different drive), not just `PermissionError` — a shared `os_replace_with_fallback` copies through a temp in the target directory and restores the original if the swap fails, keeping install/export/cache writes crash-safe (#3508, thanks @ayushcodes10).
+- Fix: files that could not be classified into any language or type are now surfaced (a count and top extensions in the console and GRAPH_REPORT) instead of vanishing from a "successful" run; noise and ignored paths are unaffected (#3511, thanks @ayushcodes10).
+- Fix: a C or C++ header with no trailing newline no longer trips a tree-sitter syntax error — a newline is appended before parsing when the source lacks one (#3513, thanks @imanolpg).
+- Fix: Office and Workspace document sidecars converted into `graphify-out/converted/` are no longer dropped when `graphify-out/` is gitignored — the tool stops ignoring its own output (#3504, thanks @ayushcodes10).
+- Fix: a call inside an exported function (`export function f(){ g() }`, `export const f = () => g()`) now resolves, including calls to aliased imports (`import { x as y }; y()`) (#3346, thanks @abhay-codes07).
+- Fix: a package.json `exports` map is now resolved by importer platform with the runtime condition preferred over `types`, so cross-package edges no longer drop to a non-existent `.d.ts` (#3487, thanks @dajiaohuang).
+- Feature: Python 3.14 is now supported — optional dependencies without 3.14 wheels are gated to drop-in replacements (`jieba` to `jieba-py`, `graspologic` to `graspologic-native`) by interpreter version, and vulnerable dependency floors (setuptools, pypdf, yt-dlp) were raised (#3490, thanks @taazbro).
+
+## 0.9.59 (2026-09-12)
+
+- Fix: an incremental rebuild no longer drops cross-file `concept` nodes from files it didn't touch — global dedup during a merge now protects existing nodes from untouched files instead of collapsing same-labeled ones across them (#3477, thanks @hopstreax).
+- Fix: extraction now falls back to sequential in-process work when the process pool cannot start (e.g. POSIX semaphore exhaustion), instead of aborting the whole run (#3497, thanks @curtismu7).
+- Performance: Python symbol resolution is roughly 47% faster — path resolution is memoized, each file parses once across both resolution passes, and the tree walk is iterative rather than recursive; extraction output is unchanged (#3500 / #3501 / #3502, thanks @abhay-codes07).
+- Fix: `graphify explain` now accepts a `path::Symbol` form to disambiguate a symbol that shares its name with its file, and the ambiguity hint now shows a form the resolver actually accepts (#3485, thanks @ayushcodes10).
+- Fix: the git hook now keeps its rebuild root inside the repository — a committed `.graphify_root` pointing outside the worktree is ignored and falls back to the repo top, so a checked-in marker can't steer the hook to scan or write outside the tree (#3265, thanks @ayushcodes10).
+
+## 0.9.58 (2026-09-10)
 
 - Fix: a call to a Python function defined nested inside another function now resolves to that inner definition per lexical scope, instead of leaking to a same-named function elsewhere; direct recursion is preserved as a self-loop (#3410, thanks @hopstreax).
 - Fix: submodule imports inside a PEP 420 namespace package (a directory with no `__init__.py`) now resolve to the target module instead of being dropped (#3429, thanks @flaukowski).
